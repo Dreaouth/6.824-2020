@@ -56,9 +56,11 @@ const (
 // ApplyMsg, but set CommandValid to false for these other uses.
 //
 type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
+	CommandValid 	bool
+	Command      	interface{}
+	CommandIndex 	int
+
+	CommandSnapshot	[]byte
 }
 
 type LogEntry struct {
@@ -82,23 +84,25 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	stopCh			chan struct{}
-	applyCh			chan ApplyMsg
+	stopCh				chan struct{}
+	applyCh				chan ApplyMsg
 
-	state			State
-	currentTerm		int
-	votedFor 		int
-	logs 			[]LogEntry
-	commitIndex 	int
-	lastApplied 	int
-	nextIndex		[]int  // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
-	matchIndex		[]int  // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+	state				State
+	currentTerm			int
+	votedFor 			int
+	logs 				[]LogEntry
+	commitIndex 		int
+	lastApplied 		int
+	nextIndex			[]int  // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	matchIndex			[]int  // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 
-	appendEntryTime	[]*time.Timer
-	electionTime	*time.Timer
-	lockStart		time.Time	// for debug
-	lockEnd			time.Time
-	lockName		string
+	lastSnapshotIndex 	int
+
+	appendEntryTimer	[]*time.Timer
+	electionTimer		*time.Timer
+	lockStart			time.Time	// for debug
+	lockEnd				time.Time
+	lockName			string
 }
 
 
@@ -117,18 +121,28 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isLeader
 }
 
+
+
+func (rf *Raft) getPersistData() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	e.Encode(rf.commitIndex)
+	e.Encode(rf.lastSnapshotIndex)
+	data := w.Bytes()
+	return data
+}
+
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.logs)
-	data := w.Bytes()
+	data := rf.getPersistData()
 	rf.persister.SaveRaftState(data)
 }
 
@@ -143,18 +157,26 @@ func (rf *Raft) readPersist(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm int
-	var votedFor int
-	var logs []LogEntry
-	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logs) != nil {
+	var votedFor 	int
+	var logs 		[]LogEntry
+	var commitIndex int
+	var lastSnapshotIndex int
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logs) != nil ||
+		d.Decode(&commitIndex) != nil  || d.Decode(&lastSnapshotIndex) != nil {
 		panic("fail to decode state")
 	} else {
 		rf.mu.Lock()
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.logs = logs
+		rf.commitIndex = commitIndex
+		rf.lastSnapshotIndex = lastSnapshotIndex
+		// bug修复： raft重启时要将rf.lastApplied初始化为lastSnapshotIndex，否则在commitLog时会报错（index为负数）
+		rf.lastApplied = lastSnapshotIndex
 		rf.mu.Unlock()
 	}
 }
+
 
 func (rf *Raft) lock(m string)  {
 	rf.mu.Lock()
@@ -175,11 +197,15 @@ func (rf *Raft) unlock(m string) {
 }
 
 
-
 func (rf *Raft) changeState(state State) {
 	switch state {
 	case Follower:
 		rf.state = state
+		/* 3B问题：之前忘加了，这样一个逻辑，当一个follower发生了网络分区，这边正常的server（leader、follower）进行正常交互。但发生分区的那个follower由于没有
+		接收到appendEntry，导致不断的成为candidate，发送requestVote，然后term自增。当网络分区问题恢复后，由于之前发生分区的那个follower的term大，所以之前的
+		leader回退到follower，但回退follower的leader由于log大于发生分区的follower，所以不会给它投票，最后还是之前是leader的follower重新开始选举并成为leader
+		 */
+		rf.resetElectionTimer()
 	case Candidate:
 		rf.state = state
 		rf.currentTerm += 1
@@ -189,12 +215,12 @@ func (rf *Raft) changeState(state State) {
 	case Leader:
 		rf.state = state
 		for i := range rf.nextIndex {
-			rf.nextIndex[i] = len(rf.logs)
+			rf.nextIndex[i] = rf.getAbsoluteLogIndex(len(rf.logs))
 		}
 		for i := range rf.matchIndex {
-			rf.matchIndex[i] = 0
+			rf.matchIndex[i] = rf.lastSnapshotIndex   // 3B，开始时是0
 		}
-		rf.electionTime.Stop()
+		rf.electionTimer.Stop()
 		rf.startAppendEntries()
 		rf.resetAppendEntriesTimer()
 		DPrintf("Server %v convert to leader\n", rf.me)
@@ -205,14 +231,13 @@ func (rf *Raft) changeState(state State) {
 // 因为是新开的一个协程，所以需要加锁
 func (rf *Raft) commitLogs() {
 	rf.lock("commitLogs")
-	DPrintf("Server %v Commit logs", rf.me)
-	if rf.commitIndex > len(rf.logs) - 1 {
+	if rf.commitIndex > rf.getAbsoluteLogIndex(len(rf.logs) - 1) {
 		DPrintf("Commit logs error, rf.commitIndex > len(rf.logs) - 1")
 	}
 
 	// 提交到applyCh，以便KVServer可以存到数据库
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		rf.applyCh <- ApplyMsg{CommandIndex: i, Command: rf.logs[i].Command, CommandValid: true}
+		rf.applyCh <- ApplyMsg{CommandIndex: i, Command: rf.logs[rf.getRelativeLogIndex(i)].Command, CommandValid: true}
 	}
 
 	rf.lastApplied = rf.commitIndex
@@ -227,6 +252,17 @@ func (rf *Raft) randElectionTimeout() time.Duration {
 }
 
 
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) getRelativeLogIndex(index int) int {
+	return index - rf.lastSnapshotIndex
+}
+
+func (rf *Raft) getAbsoluteLogIndex(index int) int {
+	return index + rf.lastSnapshotIndex
+}
 
 
 //
@@ -256,18 +292,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		rf.logs = append(rf.logs, LogEntry{
 			Term: rf.currentTerm,
-			Index: len(rf.logs),
+			Index: rf.getAbsoluteLogIndex(len(rf.logs)),
 			Command: command,
 		})
-		index = len(rf.logs) - 1
+		index = rf.getAbsoluteLogIndex(len(rf.logs) - 1)
 		rf.matchIndex[rf.me] = index
 		rf.nextIndex[rf.me] = index + 1
 		rf.persist()
+		DPrintf("Server %v start an command to be appended to Raft's log, log's last term is %v, index is %v, log length is %v",
+			rf.me, rf.logs[len(rf.logs) - 1].Term, rf.logs[len(rf.logs) - 1].Index, len(rf.logs))
 	}
 
 	rf.resetAppendEntriesTimer()
-	DPrintf("Server %v start an command to be appended to Raft's log, log's last term is %v, index is %v, log length is %v",
-		rf.me, rf.logs[len(rf.logs) - 1].Term, rf.logs[len(rf.logs) - 1].Index, len(rf.logs))
 
 	return index, term, isLeader
 }
@@ -320,10 +356,10 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.stopCh = make(chan struct{})
 	rf.applyCh = applyCh
-	rf.electionTime = time.NewTimer(rf.randElectionTimeout())
-	rf.appendEntryTime = make([]*time.Timer, len(peers))
+	rf.electionTimer = time.NewTimer(rf.randElectionTimeout())
+	rf.appendEntryTimer = make([]*time.Timer, len(peers))
 	for i,_ := range rf.peers {
-		rf.appendEntryTime[i] = time.NewTimer(HeartBeatTimeout)
+		rf.appendEntryTimer[i] = time.NewTimer(HeartBeatTimeout)
 	}
 
 	rf.state = Follower
@@ -331,10 +367,13 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.votedFor = -1
 	// 初始时日志长度为1
 	rf.logs = make([]LogEntry, 1)
-	rf.nextIndex = make([]int, len(peers))
-	rf.matchIndex = make([]int, len(peers))
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.lastSnapshotIndex = 0
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
 
 	// 发起投票
 	go func() {
@@ -342,14 +381,12 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 			select {
 			case <- rf.stopCh:
 				return
-			case <- rf.electionTime.C:
+			case <- rf.electionTimer.C:
 				go rf.startElection()
 			}
 		}
 	}()
 
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	return rf
 }

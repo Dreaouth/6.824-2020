@@ -4,6 +4,7 @@ import (
 	"../labgob"
 	"../labrpc"
 	"../raft"
+	"bytes"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -41,16 +42,17 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	msgNotify 	map[int]chan NotifyMsg
-	lastApplies	map[int64]int
-	db 			map[string]string
-	stopCh		chan struct{}
+	msgNotify 			map[int]chan NotifyMsg
+	lastApplies			map[int64]int
+	appliedRaftLogIndex	int
+	db 					map[string]string
+	stopCh				chan struct{}
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	DPrintf("server %v receive a Get request from client %v", kv.me, args.ClientId)
+	DPrintf("KVServer %v receive a Get request from client %v", kv.me, args.ClientId)
 	// 针对Get请求判断当前数据库是否存在，如果存在直接返回，省去了applyCommand的步骤
 	seq, ok := kv.lastApplies[args.ClientId]
 	if ok && args.RequestId < seq {
@@ -74,12 +76,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	if ok {
 		reply.Value = value
 	}
-	DPrintf("server %v get key:%s, err:%s, value:%s", kv.me, op.Key, reply.Err, reply.Value)
+	DPrintf("KVServer %v get key:%s, err:%s, value:%s", kv.me, op.Key, reply.Err, reply.Value)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	DPrintf("server %v receive a PutAppend request from client %v", kv.me, args.ClientId)
+	DPrintf("KVServer %v receive a PutAppend request from client %v", kv.me, args.ClientId)
 	op := Op{
 		Key:       args.Key,
 		Value:     args.Value,
@@ -89,15 +91,67 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	res := kv.applyCommand(op)
 	reply.Err = res.Err
-	DPrintf("server %v get key:%s, err:%s", kv.me, op.Key, reply.Err)
+	DPrintf("KVServer %v get key:%s, err:%s", kv.me, op.Key, reply.Err)
 }
 
 
+func (kv *KVServer) checkSnapshot() bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+	if kv.rf.GetRaftStateSize() >= kv.maxraftstate {
+		return true
+	}
+	return false
+}
+
+
+// 写入snapshot时（Leader），在KV层开始执行snapshot然后通知raft层进行snapshot
+func (kv *KVServer) takeSnapshot() {
+	kv.mu.Lock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.db)
+	e.Encode(kv.lastApplies)
+	data := w.Bytes()
+	logIndex := kv.appliedRaftLogIndex
+	kv.mu.Unlock()
+	kv.rf.SavePersistAndSnapshot(logIndex, data)
+}
+
+
+// 读取snapshot时（只有follower的KVServer会执行installSnapshot），从leader的raft进行snapshot发送RPC到follower的raft层
+// 然后通过applyCh传送到follower的KV层进行installSnapshot
+func (kv *KVServer) installSnapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var db map[string]string
+	var lastApplies map[int64]int
+	if d.Decode(&db) != nil || d.Decode(&lastApplies) != nil {
+		panic("fail to decode state")
+	} else {
+		kv.db = db
+		kv.lastApplies = lastApplies
+		DPrintf("Install Snapshot, KVServer %v db is %v", kv.me, kv.db)
+	}
+}
+
+
+// 执行raft的Start函数增加日志，并等待raft的commitLog结果
 func (kv *KVServer) applyCommand(op Op) (res NotifyMsg) {
 	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		res.Err = ErrWrongLeader
 		return res
+	}
+	// 检查是否需要快照
+	if kv.checkSnapshot() {
+		DPrintf("KVServer %v start to take a snapshot", kv.me)
+		kv.takeSnapshot()
 	}
 	kv.mu.Lock()
 	if _, ok := kv.msgNotify[index]; !ok {
@@ -105,7 +159,7 @@ func (kv *KVServer) applyCommand(op Op) (res NotifyMsg) {
 		kv.msgNotify[index] = make(chan NotifyMsg, 1)
 	}
 	ch := kv.msgNotify[index]
-	DPrintf("Server %v start applyCommand requestId:%v index:%v, term:%v", kv.me, op.RequestId, index, term)
+	DPrintf("KVServer %v start applyCommand requestId:%v index:%v, term:%v", kv.me, op.RequestId, index, term)
 	kv.mu.Unlock()
 	t := time.NewTimer(WaitCommandInterval)
 	defer t.Stop()
@@ -114,7 +168,7 @@ func (kv *KVServer) applyCommand(op Op) (res NotifyMsg) {
 		// bug修复：由于网络分区时，少数节点的leader也会进行操作。如果在一次start过后发生了网络分区，新的leader和旧的leader都执行了commit
 		// 这时就需要检测applyCommand和返回的是否是一个request，如果不是的话，返回ErrWrongLeader，重新发送RPC到其他leader
 		if res.RequestId != op.RequestId || res.ClientId != op.ClientID {
-			DPrintf("Server %d, this situation is caused by net partition", kv.me)
+			DPrintf("KVServer %d, this situation is caused by net partition", kv.me)
 			res.Err = ErrWrongLeader
 		} else {
 			res.Err = OK
@@ -130,6 +184,8 @@ func (kv *KVServer) applyCommand(op Op) (res NotifyMsg) {
 	return res
 }
 
+
+// 后台协程，用于接收并处理raft层commitLog结果，存到数据库
 func (kv *KVServer) waitApplyCh()  {
 	for {
 		select {
@@ -137,7 +193,10 @@ func (kv *KVServer) waitApplyCh()  {
 			return
 		case applyMsg := <- kv.applyCh:
 			if !applyMsg.CommandValid {
-				DPrintf("Server %v get applyMsg Command invalid, install snapshot", kv.me)
+				DPrintf("KVServer %v get applyMsg Command invalid, install snapshot", kv.me)
+				kv.mu.Lock()
+				kv.installSnapshot(applyMsg.CommandSnapshot)
+				kv.mu.Unlock()
 				continue
 			}
 			op := applyMsg.Command.(Op)
@@ -153,27 +212,29 @@ func (kv *KVServer) waitApplyCh()  {
 				if !kv.isRepeated(op.ClientID, op.RequestId) {
 					kv.db[op.Key] = op.Value
 					kv.lastApplies[op.ClientID] = op.RequestId
+					DPrintf("KVServer %v db is %v", kv.me, kv.db)
 				}
 			case "Append":
 				// bug修复：之前貌似是搞错了Append逻辑了，正确的应该是如果数据库中没有这个Key就直接append，和Put的作用一致
 				if !kv.isRepeated(op.ClientID, op.RequestId) {
 					kv.db[op.Key] += op.Value
 					kv.lastApplies[op.ClientID] = op.RequestId
+					DPrintf("KVServer %v db is %v", kv.me, kv.db)
 				}
 			default:
 				panic(fmt.Sprintf("unknown method: %s", op.Type))
 			}
-			// 检查apply前申请的channel是否存在（有可能不存在）
+			kv.appliedRaftLogIndex = applyMsg.CommandIndex
+			// 检查apply前申请的channel是否存在（对于Follower的KVServer来说就不存在channel）
 			if ch, ok := kv.msgNotify[applyMsg.CommandIndex]; ok {
-				DPrintf("Server %v apply channel %v", kv.me, op)
-				DPrintf("Server %v dp is %v", kv.me, kv.db)
+				DPrintf("KVServer %v apply channel %v", kv.me, op)
 				ch <- NotifyMsg{
 					ClientId: 	op.ClientID,
 					RequestId: 	op.RequestId,
 				}
 			}
 			kv.mu.Unlock()
-			DPrintf("kvserver %d applied command %s at index %d, request id %d, client id %d",
+			DPrintf("KVServer %d applied command %s at index %d, request id %d, client id %d",
 				kv.me, op.Type, applyMsg.CommandIndex, op.RequestId, op.ClientID)
 		}
 	}
@@ -240,6 +301,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.msgNotify = make(map[int]chan NotifyMsg)
 	kv.db = make(map[string]string)
 	kv.stopCh = make(chan struct{})
+	kv.installSnapshot(persister.ReadSnapshot())
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)

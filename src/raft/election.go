@@ -51,8 +51,11 @@ func (rf *Raft) RequestVoteHandler(args *RequestVoteArgs, reply *RequestVoteRepl
 		rf.changeState(Follower)
 	}
 
+	lastLogIndex := len(rf.logs) - 1
+
 	// Test 2B (5.4.1 election restriction)
-	if args.LastLogTerm < rf.logs[len(rf.logs) - 1].Term || (args.LastLogTerm == rf.logs[len(rf.logs) - 1].Term && args.LastLogIndex < len(rf.logs) - 1){
+	if args.LastLogTerm < rf.logs[lastLogIndex].Term || (args.LastLogTerm == rf.logs[lastLogIndex].Term && args.LastLogIndex < rf.getAbsoluteLogIndex(lastLogIndex)){
+		DPrintf("Server %v refuse to vote for server %v because of 5.4.1(2B) election restriction", rf.me, args.CandidateId)
 		return
 	}
 
@@ -108,8 +111,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 
 func (rf *Raft) resetElectionTimer()  {
-	rf.electionTime.Stop()
-	rf.electionTime.Reset(rf.randElectionTimeout())
+	rf.electionTimer.Stop()
+	rf.electionTimer.Reset(rf.randElectionTimeout())
 }
 
 
@@ -122,11 +125,12 @@ func (rf *Raft) startElection()  {
 	DPrintf("Server %v start Election\n", rf.me)
 	rf.changeState(Candidate)
 	rf.persist()
+	lastLogIndex := len(rf.logs) - 1
 	args := RequestVoteArgs{
 		Term: rf.currentTerm,
 		CandidateId: rf.me,
-		LastLogIndex: len(rf.logs) - 1,
-		LastLogTerm: rf.logs[len(rf.logs) - 1].Term,
+		LastLogIndex: rf.getAbsoluteLogIndex(lastLogIndex),
+		LastLogTerm: rf.logs[lastLogIndex].Term,
 	}
 	rf.unlock("Election")
 	voteCount := 1
@@ -142,6 +146,7 @@ func (rf *Raft) startElection()  {
 			rf.lock("down to follower")
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
+				DPrintf("Server %v is args.Term > rf.currentTer, not leader, down to follower", rf.me)
 				rf.changeState(Follower)
 				rf.resetElectionTimer()
 				rf.persist()

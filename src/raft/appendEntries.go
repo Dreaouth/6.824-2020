@@ -31,7 +31,6 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 		rf.changeState(Follower)
 		rf.resetElectionTimer()
 		rf.persist()
-		return
 	}
 
 	rf.currentTerm = args.Term
@@ -39,23 +38,39 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 	rf.resetElectionTimer()
 	rf.persist()
 
-	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 	lastLogIndex := len(rf.logs) - 1
-	if args.PrevLogIndex > lastLogIndex {
-		reply.NextIndex = lastLogIndex + 1
+	if args.PrevLogIndex < rf.lastSnapshotIndex {
+		DPrintf("Server %v this situation should not be happened", rf.me)
+		reply.Success = false
+		reply.NextIndex = rf.lastSnapshotIndex + 1
+		return
+	} else if args.PrevLogIndex == rf.lastSnapshotIndex && (args.PrevLogIndex + len(args.Entries)) > rf.lastSnapshotIndex {
+		DPrintf("Server %v sync log to leader %v", rf.me, args.LeaderID)
+		reply.Success = true
+		rf.logs = rf.logs[:1]
+		rf.logs = append(rf.logs, args.Entries...)
+		lastLogIndex = len(rf.logs) - 1
+		reply.NextIndex = rf.getAbsoluteLogIndex(lastLogIndex + 1)
+		rf.persist()  // ???
+		return
+	}
+
+	// 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+	if args.PrevLogIndex > rf.getAbsoluteLogIndex(lastLogIndex) {
+		reply.NextIndex = rf.getAbsoluteLogIndex(lastLogIndex + 1)
 		DPrintf("Server %v args.PrevLogIndex > lastLogIndex, lastLogIndex is %v, reply nextIndex is %v", rf.me, lastLogIndex, lastLogIndex + 1)
 		return
 	}
 
 	// 3. If an existing entry conflicts with a new one (different terms), delete the existing entry and all that follow it
-	if args.PrevLogTerm != rf.logs[args.PrevLogIndex].Term { // 尴尬的bug 之前是 rf.logs[lastLogIndex].Term
+	if args.PrevLogTerm != rf.logs[rf.getRelativeLogIndex(args.PrevLogIndex)].Term { // 尴尬的bug 之前是 rf.logs[lastLogIndex].Term
 		// bug修复：之前的方法是判断 args.PrevLogTerm != rf.logs[nextIndex].Term 但是测试时发现当args.PrevLogTerm大于该follower的
-		// 的Term时，无论nextIndex怎么减1都无法匹配。所以参考其他人做法，尝试跳过一个Term
+		// 的Term时，无论nextIndex怎么减1都无法匹配，导致每次都减为0。所以参考其他人做法，尝试跳过一个Term
 		// 即取follower的rf.logs[args.PrevLogIndex].Term，然后从args.PrevLogIndex往前遍历（减少循环，因为PrevLogIndex后面的一定不匹配），
 		// 当该Term发生变化或小于commitIndex时，停止遍历，返回nextIndex。相当于论文所说的 delete the existing entry and all that follow it
 		nextIndex := args.PrevLogIndex
-		term := rf.logs[args.PrevLogIndex].Term
-		for nextIndex > rf.commitIndex && term == rf.logs[nextIndex].Term {
+		term := rf.logs[rf.getRelativeLogIndex(args.PrevLogIndex)].Term
+		for nextIndex > rf.commitIndex && nextIndex > rf.lastSnapshotIndex && term == rf.logs[rf.getRelativeLogIndex(nextIndex)].Term {
 			nextIndex -= 1
 		}
 		DPrintf("Server %v args.PrevLogTerm != rf.logs[lastLogIndex].Term, lastLogIndex is %v, reply nextIndex is %v", rf.me, lastLogIndex, nextIndex + 1)
@@ -64,13 +79,13 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 	}
 
 	// 4. Append any new entries not already in the log
-	if args.PrevLogTerm == rf.logs[args.PrevLogIndex].Term { // 这里也是一个和刚才一样的小bug
+	if args.PrevLogTerm == rf.logs[rf.getRelativeLogIndex(args.PrevLogIndex)].Term { // 这里也是一个和刚才一样的小bug
 		DPrintf("Server %v args.PrevLogTerm == rf.logs[lastLogIndex].Term", rf.me)
 		reply.Success = true
 		// bug修复：应为 rf.logs[:args.PrevLogIndex + 1] 而不是 rf.logs
-		rf.logs = append(rf.logs[:args.PrevLogIndex + 1], args.Entries...)
+		rf.logs = append(rf.logs[:rf.getRelativeLogIndex(args.PrevLogIndex + 1)], args.Entries...)
 		rf.persist()
-		reply.NextIndex = len(rf.logs)
+		reply.NextIndex = rf.getAbsoluteLogIndex(len(rf.logs))
 
 		if rf.lastApplied+1 <= args.LeaderCommit {
 			rf.commitIndex = args.LeaderCommit // 与leader同步信息
@@ -80,7 +95,7 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 		// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 		if args.LeaderCommit > rf.commitIndex {
 			DPrintf("leaderCommit > commitIndex")
-			rf.commitIndex = min(args.LeaderCommit, len(rf.logs) - 1)
+			rf.commitIndex = min(args.LeaderCommit, rf.getAbsoluteLogIndex(len(rf.logs) - 1))
 		}
 	}
 	reply.Success = true
@@ -99,18 +114,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 func (rf *Raft) resetAppendEntriesTimer()  {
 	for i,_ := range rf.peers {
-		rf.appendEntryTime[i].Stop()
-		rf.appendEntryTime[i].Reset(HeartBeatTimeout)
+		rf.appendEntryTimer[i].Stop()
+		rf.appendEntryTimer[i].Reset(HeartBeatTimeout)
 	}
 }
 
 
 func (rf *Raft) resetAppendEntryTimer(server int)  {
-	rf.appendEntryTime[server].Stop()
-	rf.appendEntryTime[server].Reset(HeartBeatTimeout)
+	rf.appendEntryTimer[server].Stop()
+	rf.appendEntryTimer[server].Reset(HeartBeatTimeout)
 }
 
 
+// Leader向follower发送
 func (rf *Raft) startAppendEntry(server int)  {
 	rf.lock("startAppendEntry")
 	if rf.state != Leader {
@@ -121,17 +137,25 @@ func (rf *Raft) startAppendEntry(server int)  {
 	}
 	rf.resetAppendEntryTimer(server)
 	prevLogIndex := rf.nextIndex[server] - 1
+
+	// 当其中一个raft server发生掉线或者网络分区会出现这种情况
+	if prevLogIndex < rf.lastSnapshotIndex {
+		rf.unlock("startAppendEntry")
+		rf.startInstallSnapshot(server)
+		return
+	}
+
 	var entries []LogEntry
 	// bug修复，根据nextIndex判断是否有log需要同步，还是仅仅发送HeartBeats
-	if rf.nextIndex[server] < len(rf.logs) {
-		entries = make([]LogEntry, len(rf.logs[(prevLogIndex + 1):]))
-		copy(entries, rf.logs[(prevLogIndex + 1):])
+	if rf.nextIndex[server] < rf.getAbsoluteLogIndex(len(rf.logs)) {
+		entries = make([]LogEntry, len(rf.logs[rf.getRelativeLogIndex(prevLogIndex + 1):]))
+		copy(entries, rf.logs[rf.getRelativeLogIndex(prevLogIndex + 1):])
 	}
 	args := AppendEntriesArgs{
 		Term: rf.currentTerm,
 		LeaderID: rf.me,
 		PrevLogIndex: prevLogIndex,
-		PrevLogTerm: rf.logs[prevLogIndex].Term,
+		PrevLogTerm: rf.logs[rf.getRelativeLogIndex(prevLogIndex)].Term,
 		Entries: entries,
 		LeaderCommit: rf.commitIndex,
 	}
@@ -152,10 +176,10 @@ func (rf *Raft) startAppendEntry(server int)  {
 
 	if reply.Success {
 		DPrintf("Server %v get server %v's startAppendEntry reply success %+v", rf.me, server, reply)
-		// bug修复：在
 		if reply.NextIndex > rf.nextIndex[server] {
 			rf.nextIndex[server] = reply.NextIndex
-			// bug修复：可能存在RPC乱序 再多考虑一下 https://segmentfault.com/a/1190000021628173?utm_source=tag-newest
+			// bug修复：可能存在RPC乱序 再多考虑一下
+			// rf.matchIndex[server] = reply.NextIndex - 1
 			rf.matchIndex[server] = prevLogIndex + len(args.Entries)
 		}
 		// 当获取到AppendEntry消息，日志追加相同的server超过集群中的一半时，进行commitLog
@@ -205,7 +229,7 @@ func (rf *Raft) startAppendEntries()  {
 				select {
 				case <- rf.stopCh:
 					return
-				case <- rf.appendEntryTime[x].C:
+				case <- rf.appendEntryTimer[x].C:
 					go rf.startAppendEntry(x)
 				}
 			}
