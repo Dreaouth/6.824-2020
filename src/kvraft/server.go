@@ -174,9 +174,7 @@ func (kv *KVServer) applyCommand(op Op) (res NotifyMsg) {
 			res.Err = OK
 		}
 	case <- t.C:
-		kv.mu.Lock()
 		res.Err = ErrTimeOut
-		kv.mu.Unlock()
 	}
 	kv.mu.Lock()
 	delete(kv.msgNotify, index)
@@ -193,7 +191,7 @@ func (kv *KVServer) waitApplyCh()  {
 			return
 		case applyMsg := <- kv.applyCh:
 			if !applyMsg.CommandValid {
-				DPrintf("KVServer %v get applyMsg Command invalid, install snapshot", kv.me)
+				DPrintf("KVServer %v get receive Command invalid, install snapshot", kv.me)
 				kv.mu.Lock()
 				kv.installSnapshot(applyMsg.CommandSnapshot)
 				kv.mu.Unlock()
@@ -201,7 +199,7 @@ func (kv *KVServer) waitApplyCh()  {
 			}
 			op := applyMsg.Command.(Op)
 			kv.mu.Lock()
-			// bug修复：之前是判断 kv.isRepeated(op.ClientID, op.RequestId 如果存在重复就直接返回 continue
+			// bug修复3A：之前是判断 kv.isRepeated(op.ClientID, op.RequestId 如果存在重复就直接返回 continue
 			// 这种方式会遇到一个问题：1.当检测到了重复请求，如果直接return的话，由于重复请求已经提交并从applyMsg返回，但本函数中没有将结果通过channel传回 (ch <- NotifyMsg)
 			// 所以在applyCommand中只会检测到超时请求，进而返回timeout，所以要在case <- t.C中判断是否属于重复请求，但这种方式只能是基于超时判断，效率不高
 			// 所以我的方案还是将重复请求也通过channel传送给NotifyMsg，只是在判断Op时检测到重复请求就不改变数据库

@@ -39,6 +39,7 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 	rf.persist()
 
 	lastLogIndex := len(rf.logs) - 1
+	// 3B: snapshots
 	if args.PrevLogIndex < rf.lastSnapshotIndex {
 		DPrintf("Server %v this situation should not be happened", rf.me)
 		reply.Success = false
@@ -51,7 +52,7 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 		rf.logs = append(rf.logs, args.Entries...)
 		lastLogIndex = len(rf.logs) - 1
 		reply.NextIndex = rf.getAbsoluteLogIndex(lastLogIndex + 1)
-		rf.persist()  // ???
+		rf.persist()  // 3B: follower在接收snapshot后，发现leader的snapshot领先它，然后向leader同步snapshot，同步完成后需要持久化（3B最后一个bug）
 		return
 	}
 

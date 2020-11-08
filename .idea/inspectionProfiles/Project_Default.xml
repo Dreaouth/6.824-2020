@@ -10,6 +10,7 @@
         <function importPath="fmt" name="Print" />
         <function importPath="6.824/src/kvraft" name="DPrintf" />
         <function importPath="6.824/src/raft" name="DPrintf" />
+        <function importPath="6.824/src/shardmaster" name="DPrintf" />
       </functions>
       <methods>
         <method importPath="hash" receiver="Hash" name="Write" />
