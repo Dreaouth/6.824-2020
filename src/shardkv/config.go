@@ -218,7 +218,7 @@ func (cfg *config) StartServer(gi int, i int) {
 		cfg.net.Enable(gg.endnames[i][j], true)
 	}
 
-	// ends to talk to shardmaster service
+	// ends to talk to shardMaster service
 	mends := make([]*labrpc.ClientEnd, cfg.nmasters)
 	gg.mendnames[i] = make([]string, cfg.nmasters)
 	for j := 0; j < cfg.nmasters; j++ {

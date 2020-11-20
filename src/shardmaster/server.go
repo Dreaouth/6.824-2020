@@ -90,9 +90,27 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 // Query操作不会进行updateConfig，所以要单独处理
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	DPrintf("ShardMaster %v receive a Query, configNum is %v", sm.me, args.Num)
+
+	// 加速Query
+	reply.WrongLeader = true
+	if _, isLeader := sm.rf.GetState(); !isLeader {
+		return
+	}
+	sm.mu.Lock()
+	if args.Num >= 0 && args.Num < len(sm.configs) {
+		reply.WrongLeader, reply.Config = false, sm.configs[args.Num]
+		sm.mu.Unlock()
+		return
+	}
+	sm.mu.Unlock()
+
+	// bug修复4B：在测试4A时没问题，但到了4B就报错了，之前ClientId和RequestID还是和Join/Move/Leave一样，导致在进行Query时，会进行updateConfig
+	// 新加入的config和之前的config一样，但config.num 增加了，ShardKV查询时会一直查到相同的config(num+1)，而不做任何变化，导致死循环
 	op := Op{
 		Type:      Query,
 		Args:      *args,
+		ClientId:  nrand(),
+		RequestId: -1,
 	}
 	reply.WrongLeader = sm.applyCommand(op)
 	if !reply.WrongLeader {
@@ -102,8 +120,9 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 		} else {
 			reply.Config = sm.configs[len(sm.configs) - 1]
 		}
-		defer sm.mu.Unlock()
+		sm.mu.Unlock()
 	}
+	DPrintf("ShardMaster %v Query reply config is %v", sm.me, reply)
 }
 
 
@@ -118,7 +137,7 @@ func (sm *ShardMaster) applyCommand(op Op) bool {
 		sm.msgNotify[index] = make(chan Op, 1)
 	}
 	ch := sm.msgNotify[index]
-	DPrintf("ShardMaster %v start applyCommand requestId:%v index:%v", sm.me, op.RequestId, index)
+	DPrintf("ShardMaster %v start applyCommand %v requestId:%v index:%v", sm.me, op.Type, op.RequestId, index)
 	sm.mu.Unlock()
 	timer := time.NewTimer(WaitCommandInterval)
 	defer timer.Stop()
@@ -150,7 +169,7 @@ func (sm *ShardMaster) waitApplyCh()  {
 			}
 			op := applyMsg.Command.(Op)
 			sm.mu.Lock()
-			if !sm.isRepeated(op.ClientId, op.RequestId) {
+			if !sm.isRepeated(op.ClientId, op.RequestId) && op.RequestId >= 0 {
 				sm.updateConfig(op.Type, op.Args)
 				sm.lastApplies[op.ClientId] = op.RequestId
 			}
@@ -196,10 +215,10 @@ func (sm *ShardMaster) updateConfig(opType Type, arg interface{})  {
 		} else {
 			return
 		}
-	case Query:
 	default:
 		panic(fmt.Sprintf("unknown method: %s", opType))
 	}
+	DPrintf("ShardMaster %v new config is %+v", sm.me, config)
 	sm.configs = append(sm.configs, config)
 }
 

@@ -22,15 +22,10 @@ type Op struct {
 	Key 		string
 	Value		string
 	Type		string
-	ClientID	int64
-	RequestId	int
-}
-
-type NotifyMsg struct {
-	Err			Err
 	ClientId	int64
 	RequestId	int
 }
+
 
 type KVServer struct {
 	mu      	sync.Mutex
@@ -42,9 +37,8 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	msgNotify 			map[int]chan NotifyMsg
+	msgNotify 			map[int]chan Op
 	lastApplies			map[int64]int
-	appliedRaftLogIndex	int
 	db 					map[string]string
 	stopCh				chan struct{}
 }
@@ -65,17 +59,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	op := Op{
 		Key:       args.Key,
 		Type:      "Get",
-		ClientID:  args.ClientId,
+		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 	}
-	res := kv.applyCommand(op)
-	reply.Err = res.Err
-	kv.mu.Lock()
-	value, ok := kv.db[args.Key]
-	kv.mu.Unlock()
-	if ok {
-		reply.Value = value
-	}
+	reply.Err, reply.Value = kv.applyCommand(op)
 	DPrintf("KVServer %v get key:%s, err:%s, value:%s", kv.me, op.Key, reply.Err, reply.Value)
 }
 
@@ -86,16 +73,18 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Key:       args.Key,
 		Value:     args.Value,
 		Type:      args.Op,
-		ClientID:  args.ClientId,
+		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 	}
-	res := kv.applyCommand(op)
-	reply.Err = res.Err
+	err, _ := kv.applyCommand(op)
+	reply.Err = err
 	DPrintf("KVServer %v get key:%s, err:%s", kv.me, op.Key, reply.Err)
 }
 
 
 func (kv *KVServer) checkSnapshot() bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	if kv.maxraftstate == -1 {
 		return false
 	}
@@ -107,14 +96,13 @@ func (kv *KVServer) checkSnapshot() bool {
 
 
 // 写入snapshot时（Leader），在KV层开始执行snapshot然后通知raft层进行snapshot
-func (kv *KVServer) takeSnapshot() {
-	kv.mu.Lock()
+func (kv *KVServer) takeSnapshot(logIndex int) {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
+	kv.mu.Lock()
 	e.Encode(kv.db)
 	e.Encode(kv.lastApplies)
 	data := w.Bytes()
-	logIndex := kv.appliedRaftLogIndex
 	kv.mu.Unlock()
 	kv.rf.SavePersistAndSnapshot(logIndex, data)
 }
@@ -123,6 +111,8 @@ func (kv *KVServer) takeSnapshot() {
 // 读取snapshot时（只有follower的KVServer会执行installSnapshot），从leader的raft进行snapshot发送RPC到follower的raft层
 // 然后通过applyCh传送到follower的KV层进行installSnapshot
 func (kv *KVServer) installSnapshot(data []byte) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -142,44 +132,46 @@ func (kv *KVServer) installSnapshot(data []byte) {
 
 
 // 执行raft的Start函数增加日志，并等待raft的commitLog结果
-func (kv *KVServer) applyCommand(op Op) (res NotifyMsg) {
+func (kv *KVServer) applyCommand(op Op) (err Err, value string) {
+	//为什么不能在提交前检测request记录进行去重，是因为如果第一次KVServer向raft提交但raft在commit前挂掉了，我们无法判断该command是否成功
 	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
-		res.Err = ErrWrongLeader
-		return res
+		err = ErrWrongLeader
+		return err, ""
 	}
 	// 检查是否需要快照
-	if kv.checkSnapshot() {
-		DPrintf("KVServer %v start to take a snapshot", kv.me)
-		kv.takeSnapshot()
-	}
+	//if kv.checkSnapshot() {
+	//	DPrintf("KVServer %v start to take a snapshot", kv.me)
+	//	kv.takeSnapshot()
+	//}
 	kv.mu.Lock()
 	if _, ok := kv.msgNotify[index]; !ok {
 		// 这里对于Leader，每次新操作时都会新生产一个channel，如果没人来取，就根本放不进去，从而导致阻塞，所以改成带buffer的chan
-		kv.msgNotify[index] = make(chan NotifyMsg, 1)
+		kv.msgNotify[index] = make(chan Op, 1)
 	}
 	ch := kv.msgNotify[index]
 	DPrintf("KVServer %v start applyCommand requestId:%v index:%v, term:%v", kv.me, op.RequestId, index, term)
 	kv.mu.Unlock()
 	t := time.NewTimer(WaitCommandInterval)
 	defer t.Stop()
+	res := Op{}
 	select {
 	case res = <- ch:
 		// bug修复：由于网络分区时，少数节点的leader也会进行操作。如果在一次start过后发生了网络分区，新的leader和旧的leader都执行了commit
 		// 这时就需要检测applyCommand和返回的是否是一个request，如果不是的话，返回ErrWrongLeader，重新发送RPC到其他leader
-		if res.RequestId != op.RequestId || res.ClientId != op.ClientID {
+		if res.RequestId != op.RequestId || res.ClientId != op.ClientId {
 			DPrintf("KVServer %d, this situation is caused by net partition", kv.me)
-			res.Err = ErrWrongLeader
+			err = ErrWrongLeader
 		} else {
-			res.Err = OK
+			err = OK
 		}
 	case <- t.C:
-		res.Err = ErrTimeOut
+		err = ErrTimeOut
 	}
 	kv.mu.Lock()
 	delete(kv.msgNotify, index)
 	kv.mu.Unlock()
-	return res
+	return err, res.Value
 }
 
 
@@ -192,49 +184,53 @@ func (kv *KVServer) waitApplyCh()  {
 		case applyMsg := <- kv.applyCh:
 			if !applyMsg.CommandValid {
 				DPrintf("KVServer %v get receive Command invalid, install snapshot", kv.me)
-				kv.mu.Lock()
 				kv.installSnapshot(applyMsg.CommandSnapshot)
-				kv.mu.Unlock()
 				continue
 			}
 			op := applyMsg.Command.(Op)
-			kv.mu.Lock()
-			// bug修复3A：之前是判断 kv.isRepeated(op.ClientID, op.RequestId 如果存在重复就直接返回 continue
-			// 这种方式会遇到一个问题：1.当检测到了重复请求，如果直接return的话，由于重复请求已经提交并从applyMsg返回，但本函数中没有将结果通过channel传回 (ch <- NotifyMsg)
-			// 所以在applyCommand中只会检测到超时请求，进而返回timeout，所以要在case <- t.C中判断是否属于重复请求，但这种方式只能是基于超时判断，效率不高
-			// 所以我的方案还是将重复请求也通过channel传送给NotifyMsg，只是在判断Op时检测到重复请求就不改变数据库
-			switch op.Type {
-			case "Get":
-				kv.lastApplies[op.ClientID] = op.RequestId
-			case "Put":
-				if !kv.isRepeated(op.ClientID, op.RequestId) {
-					kv.db[op.Key] = op.Value
-					kv.lastApplies[op.ClientID] = op.RequestId
-					DPrintf("KVServer %v db is %v", kv.me, kv.db)
-				}
-			case "Append":
-				// bug修复：之前貌似是搞错了Append逻辑了，正确的应该是如果数据库中没有这个Key就直接append，和Put的作用一致
-				if !kv.isRepeated(op.ClientID, op.RequestId) {
-					kv.db[op.Key] += op.Value
-					kv.lastApplies[op.ClientID] = op.RequestId
-					DPrintf("KVServer %v db is %v", kv.me, kv.db)
-				}
-			default:
-				panic(fmt.Sprintf("unknown method: %s", op.Type))
+			kv.applyOp(&op)
+			// raft log已经commit，检查是否需要快照。以前是放在applyCommand中，参考其他人做法发现效率比较低，应该在commit后立即检查
+			if kv.checkSnapshot() {
+				DPrintf("KVServer %v start to take a snapshot", kv.me)
+				go kv.takeSnapshot(applyMsg.CommandIndex)
 			}
-			kv.appliedRaftLogIndex = applyMsg.CommandIndex
 			// 检查apply前申请的channel是否存在（对于Follower的KVServer来说就不存在channel）
 			if ch, ok := kv.msgNotify[applyMsg.CommandIndex]; ok {
 				DPrintf("KVServer %v apply channel %v", kv.me, op)
-				ch <- NotifyMsg{
-					ClientId: 	op.ClientID,
-					RequestId: 	op.RequestId,
-				}
+				ch <- op
 			}
-			kv.mu.Unlock()
 			DPrintf("KVServer %d applied command %s at index %d, request id %d, client id %d",
-				kv.me, op.Type, applyMsg.CommandIndex, op.RequestId, op.ClientID)
+				kv.me, op.Type, applyMsg.CommandIndex, op.RequestId, op.ClientId)
 		}
+	}
+}
+
+func (kv *KVServer) applyOp(op *Op)  {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	// bug修复3A：之前是判断 kv.isRepeated(op.ClientID, op.RequestId 如果存在重复就直接返回 continue
+	// 这种方式会遇到一个问题：1.当检测到了重复请求，如果直接return的话，由于重复请求已经提交并从applyMsg返回，但本函数中没有将结果通过channel传回 (ch <- NotifyMsg)
+	// 所以在applyCommand中只会检测到超时请求，进而返回timeout，所以要在case <- t.C中判断是否属于重复请求，但这种方式只能是基于超时判断，效率不高
+	// 所以我的方案还是将重复请求也通过channel传送给NotifyMsg，只是在判断Op时检测到重复请求就不改变数据库
+	switch op.Type {
+	case "Get":
+		kv.lastApplies[op.ClientId] = op.RequestId
+		op.Value = kv.db[op.Key]
+	case "Put":
+		if !kv.isRepeated(op.ClientId, op.RequestId) {
+			kv.db[op.Key] = op.Value
+			kv.lastApplies[op.ClientId] = op.RequestId
+			DPrintf("KVServer %v db is %v", kv.me, kv.db)
+		}
+	case "Append":
+		// bug修复：之前貌似是搞错了Append逻辑了，正确的应该是如果数据库中没有这个Key就直接append，和Put的作用一致
+		if !kv.isRepeated(op.ClientId, op.RequestId) {
+			kv.db[op.Key] += op.Value
+			kv.lastApplies[op.ClientId] = op.RequestId
+			DPrintf("KVServer %v db is %v", kv.me, kv.db)
+		}
+	default:
+		panic(fmt.Sprintf("unknown method: %s", op.Type))
 	}
 }
 
@@ -296,7 +292,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.lastApplies = make(map[int64]int)
-	kv.msgNotify = make(map[int]chan NotifyMsg)
+	kv.msgNotify = make(map[int]chan Op)
 	kv.db = make(map[string]string)
 	kv.stopCh = make(chan struct{})
 	kv.installSnapshot(persister.ReadSnapshot())
