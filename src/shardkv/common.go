@@ -54,7 +54,7 @@ type MigrateArgs struct {
 
 /*
 	4B:只是发SHARD DATA是不够的。比如一个APPEND REQUEST 在向A发送的时候，timeout了。这个时候A已经做了这个更新操作。在这个点之后，Reconfiguration 发生，
-CLIENT 去问B发送APPEND REQ。如果只是SHARD DATA过去。会造成APPEND 2次。所以我们还需要把去重的map（LastApplies）也一起发过去。
+CLIENT 去问B发送APPEND REQ。如果只是SHARD DATA过去。会造成APPEND 2次。所以我们还需要把用于去重的map（LastApplies）也一起发过去。
  */
 type MigrateReply struct {
 	Err			Err
@@ -62,6 +62,15 @@ type MigrateReply struct {
 	Shard		int
 	DB 			map[string]string
 	LastApplies	map[int64]int
+}
+
+type GCArgs struct {
+	Shard 		int
+	ConfigNum	int
+}
+
+type GCReply struct {
+	Err			Err
 }
 
 func Max(a, b int) int {

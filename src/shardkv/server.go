@@ -62,6 +62,7 @@ type ShardKV struct {
 	toOutShards		map[int]map[int]map[string]string	// cfg num -> (shard -> DB)
 	comeInShards	map[int]int		// shard -> config num
 	ownShards		map[int]bool	// 当前可以提供服务的shard（进行pull时需要pull进来的shard不能接受）
+	garbages		map[int]map[int]bool // cfg num -> shards
 }
 
 
@@ -132,6 +133,7 @@ func (kv *ShardKV) takeSnapshot(logIndex int) {
 	e.Encode(kv.toOutShards)
 	e.Encode(kv.comeInShards)
 	e.Encode(kv.ownShards)
+	e.Encode(kv.garbages)
 	e.Encode(kv.cfg)
 	data := w.Bytes()
 	kv.mu.Unlock()
@@ -153,10 +155,11 @@ func (kv *ShardKV) installSnapshot(data []byte) {
 	var toOutShards		map[int]map[int]map[string]string
 	var comeInShards	map[int]int
 	var ownShards		map[int]bool
+	var garbages		map[int]map[int]bool
 	var cfg				shardmaster.Config
 	// bug修复：decode的顺序要和encode的一致
 	if d.Decode(&db) != nil || d.Decode(&lastApplies) != nil || d.Decode(&toOutShards) != nil || d.Decode(&comeInShards) != nil ||
-		d.Decode(&ownShards) != nil || d.Decode(&cfg) != nil {
+		d.Decode(&ownShards) != nil || d.Decode(&garbages) != nil || d.Decode(&cfg) != nil {
 		panic("fail to decode state")
 	} else {
 		kv.db = db
@@ -164,6 +167,7 @@ func (kv *ShardKV) installSnapshot(data []byte) {
 		kv.ownShards = ownShards
 		kv.comeInShards = comeInShards
 		kv.toOutShards = toOutShards
+		kv.garbages = garbages
 		kv.cfg = cfg
 		DPrintf("Install Snapshot, ShardKV %v db is %v", kv.me, kv.db)
 	}
@@ -238,7 +242,12 @@ func (kv *ShardKV) waitApplyCh() {
 				kv.applyMigrateData(migrateReply)
 			} else {
 				op := applyMsg.Command.(Op)
-				kv.applyOp(&op)
+				// 单独处理一下GC
+				if op.Type == "GC" {
+					kv.applyGC(&op)
+				} else {
+					kv.applyOp(&op)
+				}
 				// raft log已经commit，检查是否需要快照
 				if kv.checkSnapshot() {
 					DPrintf("ShardKV %v-%v start to take a snapshot", kv.gid, kv.me)
@@ -342,7 +351,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(Op{})
 
 	// bug修复：panic: runtime error: invalid memory address or nil pointer dereference [signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x58bf69]
-	// 是由于ShardKV向raft提交更新的config导致的，在labgob注册后就不会报错了
+	// 是由于ShardKV向raft提交更新的config导致的，在labgob注册后就不会报错了 labgob.Register(shardmaster.Config{})
 	labgob.Register(MigrateArgs{})
 	labgob.Register(MigrateReply{})
 	labgob.Register(shardmaster.Config{})
@@ -364,6 +373,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.toOutShards = make(map[int]map[int]map[string]string)
 	kv.comeInShards = make(map[int]int)
 	kv.ownShards = make(map[int]bool)
+	kv.garbages = make(map[int]map[int]bool)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -375,6 +385,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.waitApplyCh()
 	go kv.daemon(kv.tryPollNewConfig, 50)
 	go kv.daemon(kv.tryPullShard, 100)
+	go kv.daemon(kv.tryGC, 100)
 
 	return kv
 }

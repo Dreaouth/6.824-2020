@@ -107,10 +107,13 @@ func (kv *ShardKV) applyMigrateData(migrateData MigrateReply)  {
 		for k, v := range migrateData.LastApplies {
 			kv.lastApplies[k] = Max(v, kv.lastApplies[k])
 		}
+		if _, ok := kv.garbages[migrateData.ConfigNum]; !ok {
+			kv.garbages[migrateData.ConfigNum] = make(map[int]bool)
+		}
+		kv.garbages[migrateData.ConfigNum][migrateData.Shard] = true
 	}
 	DPrintf("ShardKV %v-%v successful update migrateData shard is %v, migrate db is %+v", kv.gid, kv.me, migrateData.Shard, migrateData.DB)
 	DPrintf("ShardKV %v-%v own shards is %+v", kv.gid, kv.me, kv.ownShards)
-	DPrintf("ShardKV %v-%v db is %+v", kv.gid, kv.me, kv.db)
 }
 
 
