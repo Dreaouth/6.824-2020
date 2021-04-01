@@ -118,7 +118,6 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.unlock("GetState")
 	if isLeader {
 		DPrintf("Server %v get state is leader: %v", rf.me, isLeader)
-
 	}
 	return term, isLeader
 }
@@ -305,9 +304,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			rf.me, rf.logs[len(rf.logs) - 1].Term, rf.logs[len(rf.logs) - 1].Index, len(rf.logs))
 	}
 
-	// bug修复？
-	//rf.resetAppendEntriesTimer()
-
 	return index, term, isLeader
 }
 
@@ -389,7 +385,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 			}
 		}
 	}()
-
 
 	return rf
 }

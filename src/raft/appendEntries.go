@@ -17,7 +17,7 @@ type AppendEntriesReply struct {
 	NextIndex	 int
 }
 
-func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntriesReply)  {
+func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	DPrintAppendEntriesArgs(rf.me, args)
 	rf.lock("AppendEntriesHandler")
 	defer rf.unlock("AppendEntriesHandler")
@@ -83,7 +83,7 @@ func (rf *Raft) AppendEntriesHandler(args *AppendEntriesArgs, reply *AppendEntri
 	if args.PrevLogTerm == rf.logs[rf.getRelativeLogIndex(args.PrevLogIndex)].Term { // 这里也是一个和刚才一样的小bug
 		DPrintf("Server %v args.PrevLogTerm == rf.logs[lastLogIndex].Term", rf.me)
 		reply.Success = true
-		// bug修复：应为 rf.logs[:args.PrevLogIndex + 1] 而不是 rf.logs
+		// bug修复：应为 rf.logs[:args.PrevLogIndex + 1] 而不是 rf.logs (RPC乱序的问题)
 		rf.logs = append(rf.logs[:rf.getRelativeLogIndex(args.PrevLogIndex + 1)], args.Entries...)
 		rf.persist()
 		reply.NextIndex = rf.getAbsoluteLogIndex(len(rf.logs))

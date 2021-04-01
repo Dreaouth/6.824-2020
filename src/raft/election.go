@@ -36,7 +36,7 @@ func (rf *Raft) RequestVoteHandler(args *RequestVoteArgs, reply *RequestVoteRepl
 		if rf.state == Leader {
 			return
 		}
-		if  rf.votedFor == args.CandidateId {
+		if rf.votedFor == args.CandidateId {
 			reply.VoteGranted = true
 			return
 		} else if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
